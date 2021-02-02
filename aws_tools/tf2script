@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Requirements to run this script:
+# - aws cli
+# - jq
+
+set -eo pipefail
+
+serial_number="arn:aws:iam::225506373417:mfa/${USER}"
+role_session_name=${USER}
+tf_bin=$(which terraform)
+credentials_file=~/.aws/cli/terraform_credentials
+
+function check_creds_file_exists() {
+    if [[ -f ${credentials_file} ]]
+    then
+        echo "Credentials file found, sourcing it"
+        source ${credentials_file}
+    else
+        echo "Credentials file not found, creating ${credentials_file}"
+        touch ${credentials_file}
+    fi
+}
+
+# converts a ISO 8601 time/date string to UNIX epoch
+# see https://perldoc.perl.org/Time::Piece for details on parsing
+function to_epoch() {
+    local iso8601=$1
+    # the regex below is to remove the colon from timezone, which Time::Piece->strptime cannot handle
+    echo "${iso8601}" | perl -MTime::Piece -nlE 's/(.*)\+(\d{2})\:(\d{2})/$1+$2$3/;$f=q{%Y-%m-%dT%H:%M:%S%z};$t=Time::Piece->strptime($_,$f)+1;say $t->epoch'
+}
+
+if echo ${PWD} | grep denakop
+then
+    aws_environment="denakop"
+    credentials_file=~/.aws/cli/terraform_credentials_${aws_environment}
+    check_creds_file_exists
+    role_arn="arn:aws:iam::225506373417:role/denakop_admins"
+fi
+
+now=$(date '+%s')
+
+if [ -z "${AWS_EXPIRATION}" ]
+then
+    # no previous authentication available
+    expires=0
+else
+    expires=$(to_epoch "${AWS_EXPIRATION}")
+fi
+
+if [[ "${expires}" -lt "${now}" ]]
+then
+    echo ""
+    echo "Current credentials expired, creating new ones"
+    echo ""
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_EXPIRATION
+    echo ""
+    echo "Input MFA code:"
+    read code
+    result=$(aws sts assume-role --role-arn ${role_arn} --role-session-name ${role_session_name} --serial-number ${serial_number}  --token-code ${code})
+    credentials=$(echo ${result} | jq -r '.Credentials')
+    echo export AWS_ACCESS_KEY_ID=$(echo ${credentials} | jq -r '.AccessKeyId') > ${credentials_file}
+    echo export AWS_SECRET_ACCESS_KEY=$(echo ${credentials} | jq -r '.SecretAccessKey') >> ${credentials_file}
+    echo export AWS_SESSION_TOKEN=$(echo  ${credentials} | jq -r '.SessionToken') >> ${credentials_file}
+    echo export AWS_EXPIRATION=$(echo ${credentials} | jq -r '.Expiration') >> ${credentials_file}
+    echo export AWS_ENVIRONMENT=$(echo ${aws_environment}) >> ${credentials_file}
+    export AWS_ACCESS_KEY_ID=$(echo ${credentials} | jq -r '.AccessKeyId')
+    export AWS_SECRET_ACCESS_KEY=$(echo ${credentials} | jq -r '.SecretAccessKey')
+    export AWS_SESSION_TOKEN=$(echo  ${credentials} | jq -r '.SessionToken')
+    export AWS_EXPIRATION=$(echo ${credentials} | jq -r '.Expiration')
+    export AWS_ENVIRONMENT=$(echo ${aws_environment})
+else
+    echo "Previous credentials still valid"
+    echo "Running Terraform"
+fi
+
+${tf_bin} "$@"
